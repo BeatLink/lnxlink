@@ -118,7 +118,7 @@ python3Packages.buildPythonApplication {
     # Teach the self-updater that it is not in charge here. Without this the
     # store path falls through to the "pip" branch and the update entity in
     # Home Assistant would try `pip install -U lnxlink`.
-    substituteInPlace lnxlink/files_setup.py \
+    substituteInPlace lnxlink/modules/scripts/helpers.py \
       --replace-fail \
         'method = "pip"' \
         'method = "nix" if path.startswith("/nix/store") else "pip"'
