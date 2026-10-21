@@ -1,8 +1,14 @@
 """Toggle between performance, balanced, or power-saver profiles"""
+import logging
 import re
 from shutil import which
 
+from jeepney import DBusAddress, new_method_call
+from jeepney.io.blocking import open_dbus_connection
+
 from lnxlink.modules.scripts.helpers import syscommand
+
+logger = logging.getLogger("lnxlink")
 
 
 class Addon:
@@ -12,13 +18,25 @@ class Addon:
         """Setup addon"""
         self.name = "Power Profile"
         self.lnxlink = lnxlink
-        if which("powerprofilesctl") is None:
-            raise SystemError("System command 'powerprofilesctl' not found")
-        self.options = self._get_power_profiles()
+        self.use_dbus = False
+        self.conn = None
+
+        try:
+            profiles_data = self._dbus("Profiles")
+            self.options = [p["Profile"][1] for p in profiles_data if "Profile" in p]
+            self.use_dbus = True
+        except Exception as err:
+            if which("powerprofilesctl") is None:
+                raise SystemError(
+                    "Power profiles service or 'powerprofilesctl' not found"
+                ) from err
+            self.options = self._get_power_profiles_cli()
 
     def get_info(self):
         """Gather information from the system"""
-        stdout, _, _ = syscommand("powerprofilesctl get")
+        if self.use_dbus:
+            return self._dbus("ActiveProfile")
+        stdout, _, _ = syscommand(["powerprofilesctl", "get"])
         return stdout
 
     def exposed_controls(self):
@@ -36,13 +54,49 @@ class Addon:
 
     def start_control(self, topic, data):
         """Control system"""
-        syscommand(f"powerprofilesctl set {data}")
+        if data in self.options:
+            if self.use_dbus:
+                self._dbus("ActiveProfile", data)
+            else:
+                syscommand(["powerprofilesctl", "set", str(data)])
+        else:
+            logger.error(
+                "Invalid power profile '%s'. Allowed options: %s",
+                data,
+                self.options,
+            )
 
-    def _get_power_profiles(self):
-        """Get the power profiles in the correct order"""
+    def _get_power_profiles_cli(self):
+        """Get the power profiles in the correct order via CLI"""
         profiles_pattern = re.compile(r"([\w-]+):\n")
+        stdout, _, _ = syscommand(["powerprofilesctl", "list"])
+        return re.findall(profiles_pattern, stdout)
 
-        stdout, _, _ = syscommand("powerprofilesctl list")
-        profiles = re.findall(profiles_pattern, stdout)
+    def _dbus(self, prop="ActiveProfile", value=None):
+        """Interact with PowerProfiles D-Bus service"""
+        if self.conn is None:
+            self.conn = open_dbus_connection(bus="SYSTEM")
 
-        return profiles
+        addr = DBusAddress(
+            "/net/hadess/PowerProfiles",
+            bus_name="net.hadess.PowerProfiles",
+            interface="org.freedesktop.DBus.Properties",
+        )
+        if value is None:
+            msg = new_method_call(
+                addr,
+                "Get",
+                "ss",
+                ("net.hadess.PowerProfiles", prop),
+            )
+            reply = self.conn.send_and_get_reply(msg)
+            return reply.body[0][1]
+
+        msg = new_method_call(
+            addr,
+            "Set",
+            "ssv",
+            ("net.hadess.PowerProfiles", prop, ("s", str(value))),
+        )
+        self.conn.send_and_get_reply(msg)
+        return None

@@ -2,6 +2,7 @@
 import base64
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -109,8 +110,7 @@ class FastVideoCapture:
 
         if self.process is not None:
             try:
-                # Kill the entire process group
-                os.killpg(os.getpgid(self.process.pid), 9)
+                os.killpg(self.process.pid, signal.SIGKILL)
             except Exception:
                 try:
                     self.process.kill()
@@ -127,17 +127,6 @@ class FastVideoCapture:
 
         # Clean up OpenCV and process
         self.cleanup()
-
-        # Kill all gpu-screen-recorder processes as fallback
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-f", "gpu-screen-recorder"],
-                timeout=2.0,
-                capture_output=True,
-                check=False,
-            )
-        except Exception:
-            pass
 
 
 class Addon:
@@ -160,7 +149,9 @@ class Addon:
 
     def _requirements(self):
         self.lib = {
-            "cv2": import_install_package("opencv-python", ">=4.7.0.68", "cv2"),
+            "cv2": import_install_package(
+                "opencv-python-headless", ">=4.7.0.72", "cv2"
+            ),
         }
 
     def get_camera_frame(self):

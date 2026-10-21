@@ -2,15 +2,30 @@
 import base64
 import hashlib
 import logging
+import os
 import re
+import shlex
 import subprocess
 import threading
 import traceback
+from io import BytesIO
 from shutil import which
 
 from lnxlink.modules.scripts.helpers import import_install_package, syscommand
 
 logger = logging.getLogger("lnxlink")
+
+# Base64 adds about one third, leaving headroom below 128 KiB broker limits.
+MAX_THUMBNAIL_BYTES = 64 * 1024
+MAX_THUMBNAIL_PIXELS = 16 * 1024 * 1024
+THUMBNAIL_PROFILES = (
+    (512, 85),
+    (384, 80),
+    (256, 70),
+    (128, 60),
+    (96, 55),
+    (64, 50),
+)
 
 
 # pylint: disable=too-many-instance-attributes
@@ -24,8 +39,11 @@ class Addon:
         self.players = []
         self._requirements()
         self.prev_info = {}
+        self.thumbnail_cache = (None, b" ")
         self.playmedia_thread = None
         self.process = None
+        self.prev_volume = None
+        self.volume_monitor_thread = None
         self.audio_system = self._get_audio_system()
         self.mediavolume = "OFF"
         if self.audio_system is None:
@@ -82,6 +100,11 @@ class Addon:
         self.dbus_mediaplayer = import_install_package(
             "dbus-mediaplayer", ">=2026.7.0", "dbus_mediaplayer"
         )
+        pillow = import_install_package(
+            "Pillow", ">=10.4.0", ("PIL", ["Image", "ImageOps"])
+        )
+        self.image = pillow.Image
+        self.image_ops = pillow.ImageOps
 
     def exposed_controls(self):
         """Exposes to home assistant"""
@@ -138,13 +161,19 @@ class Addon:
             },
         }
 
+    # pylint: disable=too-many-branches
     def start_control(self, topic, data):
         """Control system"""
         if topic[-1] in ["set_volume", "volume_set"]:
-            if data <= 1:
-                data *= 100
-            data = int(min(data, 100))
-            self._set_volume(data)
+            try:
+                volume = float(data)
+            except (ValueError, TypeError):
+                logger.error("Invalid volume value: %s", data)
+                return
+            if volume <= 1:
+                volume *= 100
+            volume = int(min(max(volume, 0), 100))
+            self._set_volume(volume)
         elif len(self.players) > 0 and topic[-1] == "playpause":
             self.media_player.control_media("PlayPause")
         elif len(self.players) > 0 and topic[-1] == "play":
@@ -158,6 +187,12 @@ class Addon:
             self.media_player.control_media("Next")
         elif topic[-1] == "play_media":
             self.play_media(data)
+        elif len(self.players) > 0 and topic[-1] in ["seek", "set_position"]:
+            try:
+                position = round(float(data))
+                self.media_player.control_setposition(position)
+            except (ValueError, TypeError):
+                logger.error("Invalid seek position value: %s", data)
         elif topic[-1] in ["stop_media", "pause"]:
             self.stop_playmedia()
         elif topic[-1] == "media_volume":
@@ -217,6 +252,10 @@ class Addon:
                 self.lnxlink.run_module(f"{self.name}/albumart", "")
         return info
 
+    def invalidate_cache(self):
+        """Force media state to be queued again after reconnecting."""
+        self.prev_info = {}
+
     def media_callback(self, players):
         """Callback function to update media information"""
         self.players = players
@@ -229,12 +268,70 @@ class Addon:
             try:
                 arturl = player["arturl"].replace("file://", "")
                 with open(arturl, "rb") as image_file:
-                    image_thumbnail = base64.b64encode(image_file.read())
-                    return image_thumbnail
+                    file_stat = os.fstat(image_file.fileno())
+                    cache_key = (
+                        arturl,
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        file_stat.st_size,
+                        file_stat.st_mtime_ns,
+                    )
+                    if self.thumbnail_cache[0] == cache_key:
+                        return self.thumbnail_cache[1]
+                    image_data = image_file.read(MAX_THUMBNAIL_BYTES + 1)
+                if len(image_data) <= MAX_THUMBNAIL_BYTES:
+                    thumbnail = base64.b64encode(image_data)
+                else:
+                    thumbnail = self._resize_thumbnail(arturl)
+                self.thumbnail_cache = (cache_key, thumbnail)
+                return thumbnail
             except Exception as err:
                 logger.debug(
                     "Can't create thumbnail: %s, %s", err, traceback.format_exc()
                 )
+        return b" "
+
+    def _resize_thumbnail(self, arturl):
+        """Resize and recompress artwork to stay below the MQTT payload limit."""
+        with self.image.open(arturl) as source_image:
+            if source_image.width * source_image.height > MAX_THUMBNAIL_PIXELS:
+                logger.warning(
+                    "Refusing to decode %dx%d media thumbnail: %s",
+                    source_image.width,
+                    source_image.height,
+                    arturl,
+                )
+                return b" "
+            source_image.load()
+            source_image = self.image_ops.exif_transpose(source_image)
+            has_transparency = source_image.mode in ("RGBA", "LA") or (
+                "transparency" in source_image.info
+            )
+            image = source_image.convert("RGBA" if has_transparency else "RGB")
+            for max_dimension, quality in THUMBNAIL_PROFILES:
+                image.thumbnail(
+                    (max_dimension, max_dimension), self.image.Resampling.LANCZOS
+                )
+                output = BytesIO()
+                if has_transparency:
+                    image.save(output, format="PNG", optimize=True)
+                else:
+                    image.save(output, format="JPEG", quality=quality, optimize=True)
+                image_data = output.getvalue()
+                if len(image_data) <= MAX_THUMBNAIL_BYTES:
+                    logger.debug(
+                        "Resized media thumbnail to %dx%d and %d bytes: %s",
+                        image.width,
+                        image.height,
+                        len(image_data),
+                        arturl,
+                    )
+                    return base64.b64encode(image_data)
+        logger.warning(
+            "Can't resize media thumbnail below %d bytes: %s",
+            MAX_THUMBNAIL_BYTES,
+            arturl,
+        )
         return b" "
 
     def stop_playmedia(self):
@@ -295,18 +392,18 @@ class Addon:
     def run_playmedia_thread(self, player, options, url, media_type):
         """Runs in the background"""
         logger.info("Playing %s using app %s", media_type, player)
-        commands = ["exec", player]
+        commands = [player]
         if media_type == "image":
-            commands.append(options["opt_static"])
+            commands.extend(shlex.split(options["opt_static"]))
         elif media_type == "audio":
-            commands.append(options["opt_background"])
+            commands.extend(shlex.split(options["opt_background"]))
         elif media_type in ["video", "playlist", "other"]:
-            commands.append(options["opt_foreground"])
+            commands.extend(shlex.split(options["opt_foreground"]))
         commands.append(url)
         # pylint: disable=consider-using-with
         self.process = subprocess.Popen(
-            " ".join(commands),
-            shell=True,
+            commands,
+            shell=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
         )
@@ -315,43 +412,98 @@ class Addon:
 
     def _get_audio_system(self):
         """Get system volume type"""
-        _, _, returncode = syscommand(
-            "pactl get-sink-volume @DEFAULT_SINK@", ignore_errors=True
-        )
-        if returncode == 0:
-            return "pactl"
+        if which("pactl") is not None:
+            _, _, returncode = syscommand(
+                ["pactl", "get-sink-volume", "@DEFAULT_SINK@"], ignore_errors=True
+            )
+            if returncode == 0:
+                return "pactl"
 
-        _, _, returncode = syscommand("amixer get Master", ignore_errors=True)
-        if returncode == 0:
-            return "amixer"
+        if which("amixer") is not None:
+            _, _, returncode = syscommand(
+                ["amixer", "get", "Master"], ignore_errors=True
+            )
+            if returncode == 0:
+                return "amixer"
 
         return None
 
+    def _start_volume_monitor(self):
+        """Start thread to monitor system volume events"""
+        if self.audio_system == "pactl" and (
+            self.volume_monitor_thread is None
+            or not self.volume_monitor_thread.is_alive()
+        ):
+            self.volume_monitor_thread = threading.Thread(
+                target=self._monitor_volume_events,
+                daemon=True,
+            )
+            self.volume_monitor_thread.start()
+
+    def _monitor_volume_events(self):
+        """Listens for real-time audio server volume events"""
+        try:
+            with subprocess.Popen(
+                ["pactl", "subscribe"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ) as proc:
+                logger.debug("Started monitoring volume events")
+                for line in iter(proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    if "sink" in line.lower() or "server" in line.lower():
+                        prev_vol = self.prev_volume
+                        current_volume = self._get_volume()
+                        if current_volume != prev_vol:
+                            self.lnxlink.run_module(
+                                f"{self.name}/volume", current_volume
+                            )
+        except Exception as err:
+            logger.debug("Error in volume monitor: %s", err)
+
     def _get_volume(self):
         """Get system volume"""
+        logger.debug("Using audio system: %s", self.audio_system)
+        if self.audio_system is None:
+            self.audio_system = self._get_audio_system()
+            if self.audio_system is not None:
+                self.mediavolume = "OFF"
+        if self.audio_system is not None:
+            self._start_volume_monitor()
+
         volume = 100
         if self.audio_system == "pactl":
             result, _, _ = syscommand(
-                "pactl get-sink-volume @DEFAULT_SINK@", ignore_errors=True
+                ["pactl", "get-sink-volume", "@DEFAULT_SINK@"], ignore_errors=True
             )
             match = re.search(r"(\d+)%", result)
             if match:
                 volume = int(match.group(1))
         elif self.audio_system == "amixer":
-            result, _, _ = syscommand("amixer get Master", ignore_errors=True)
+            result, _, _ = syscommand(["amixer", "get", "Master"], ignore_errors=True)
             match = re.search(r"(\d+)%", result)
             if match:
                 volume = int(match.group(1))
-        return round(volume / 100, 2)
+        self.prev_volume = round(volume / 100, 2)
+        return self.prev_volume
 
     def _set_volume(self, volume):
         """Set system volume"""
+        if self.audio_system is None:
+            self.audio_system = self._get_audio_system()
+            if self.audio_system is not None:
+                self.mediavolume = "OFF"
+        if self.audio_system is not None:
+            self._start_volume_monitor()
+
         if self.mediavolume == "ON":
             self.media_player.control_volume(volume / 100)
         elif self.audio_system == "pactl":
-            syscommand(f"pactl set-sink-volume @DEFAULT_SINK@ {volume}%")
+            syscommand(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{volume}%"])
         elif self.audio_system == "amixer":
-            syscommand(f"amixer set Master {volume}%")
+            syscommand(["amixer", "set", "Master", f"{volume}%"])
         else:
             logger.error("Can't find pactl or amixer commands")
 

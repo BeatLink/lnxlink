@@ -46,6 +46,7 @@ mqtt:
     user: 'user'
     pass: 'pass'
     tls: false
+    tls_allow_insecure: false
     keyfile: ""
     certfile: ""
     ca_certs: ""
@@ -59,8 +60,6 @@ mqtt:
   homeassistant:
     url: ""
     token: ""
-    token_env: ""
-    token_file: ""
     timeout: 20
     verify_ssl: true
     subscribe_commands: true
@@ -90,7 +89,7 @@ exclude:
   - restful
   - screen_onoff
   - screenshot
-  - send_keys
+  - keyboard
   - speech_recognition
   - systemd
   - webcam

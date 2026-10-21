@@ -1,12 +1,10 @@
 """Update LNXlink directly remotely"""
+# pylint: disable=import-outside-toplevel
 import logging
 import re
-import sys
 import time
 
-import requests
-
-from lnxlink.modules.scripts.helpers import find_uv_bin, syscommand
+from lnxlink.modules.scripts.helpers import find_uv_bin, install_package, syscommand
 
 logger = logging.getLogger("lnxlink")
 
@@ -55,6 +53,8 @@ class Addon:
 
     def _latest_version(self):
         """Gets the currently published version of lnxlink"""
+        import requests
+
         url = "https://api.github.com/repos/bkbilly/lnxlink/releases/latest"
         try:
             resp = requests.get(url=url, timeout=5).json()
@@ -82,51 +82,55 @@ class Addon:
         if "_edit" in method:
             return self._update_edit(method)
         if method == "pipx":
-            syscommand("pipx upgrade lnxlink", timeout=120)
+            _, _, returncode = syscommand("pipx upgrade lnxlink", timeout=120)
         elif method == "uv":
             uv_bin = find_uv_bin() or "uv"
-            syscommand(f"{uv_bin} tool upgrade lnxlink", timeout=120)
+            _, _, returncode = syscommand(f"{uv_bin} tool upgrade lnxlink", timeout=120)
         elif method == "flatpak":
-            syscommand("flatpak update -y io.github.bkbilly.lnxlink", timeout=120)
-        elif method == "snap":
-            syscommand("snap refresh lnxlink", timeout=120)
+            _, _, returncode = syscommand(
+                "flatpak update -y io.github.bkbilly.lnxlink", timeout=120
+            )
         elif method == "aur":
             return self._update_aur()
         elif method in ("pip", "system"):
-            syscommand(f"{sys.executable} -m pip install -U lnxlink", timeout=120)
+            return install_package("lnxlink", upgrade=True, quiet=False, timeout=120)
         else:
             logger.warning("Update not supported for install method: %s", method)
             return False
-        return True
+        return returncode == 0
 
     def _update_edit(self, method):
         """Handle update for editable installations"""
-        syscommand(f"git -C {self.lnxlink.path} pull", timeout=15)
-        if "pip" in method:
-            syscommand(
-                f"{sys.executable} -m pip install -e {self.lnxlink.path}",
-                timeout=120,
-            )
-        elif "uv" in method:
-            uv_bin = find_uv_bin() or "uv"
-            syscommand(
-                f"{uv_bin} pip install --python {sys.executable} -e {self.lnxlink.path}",
-                timeout=120,
-            )
-        else:
-            logger.warning("Update not supported for install method: %s", method)
+        _, _, returncode = syscommand(
+            ["git", "-c", "safe.directory=*", "-C", self.lnxlink.path, "pull"],
+            timeout=15,
+        )
+        if returncode != 0:
             return False
-        return True
+        if any(m in method for m in ("pip", "system", "uv")):
+            return install_package(
+                self.lnxlink.path,
+                upgrade=False,
+                editable=True,
+                quiet=False,
+                timeout=120,
+            )
+        logger.warning("Update not supported for install method: %s", method)
+        return False
 
     def _update_aur(self):
         """Handle update for AUR installations"""
         _, _, yay = syscommand("which yay", ignore_errors=True)
         _, _, paru = syscommand("which paru", ignore_errors=True)
         if yay == 0:
-            syscommand("yay -Syu --noconfirm python-lnxlink", timeout=120)
+            _, _, returncode = syscommand(
+                "yay -Syu --noconfirm python-lnxlink", timeout=120
+            )
         elif paru == 0:
-            syscommand("paru -Syu --noconfirm python-lnxlink", timeout=120)
+            _, _, returncode = syscommand(
+                "paru -Syu --noconfirm python-lnxlink", timeout=120
+            )
         else:
             logger.warning("No AUR helper found (yay or paru)")
             return False
-        return True
+        return returncode == 0

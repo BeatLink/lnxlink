@@ -1,5 +1,6 @@
 """A collection of helper functions"""
 import importlib.metadata
+import inspect
 import logging
 import os
 import shutil
@@ -9,21 +10,102 @@ import sys
 logger = logging.getLogger("lnxlink")
 
 
-# pylint: disable=consider-using-with
-def syscommand(command, ignore_errors=False, timeout=3, background=False):
-    """Global subprocess command"""
-    logger.debug("Executing command: %s", command)
+def _get_installer():
+    """Get the installer tool name from package metadata"""
+    try:
+        dist = importlib.metadata.distribution("lnxlink")
+        installer_file = dist.read_text("INSTALLER")
+        if installer_file:
+            return installer_file.strip()
+    except Exception:
+        pass
+    return ""
 
-    if isinstance(command, list):
-        command = " ".join(command)
+
+def get_install_method():
+    """Detect how lnxlink was installed"""
+    path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    installer = _get_installer()
+    if os.environ.get("FLATPAK_ID"):
+        method = "flatpak"
+    elif os.path.exists("/.dockerenv"):
+        method = "docker"
+    elif "pipx" in path:
+        method = "pipx"
+    elif "/uv/" in path or installer == "uv":
+        method = "uv"
+    elif (
+        path.startswith("/usr/lib")
+        and syscommand("pacman -Qq python-lnxlink", ignore_errors=True)[2] == 0
+    ):
+        method = "aur"
+    elif path.startswith("/usr/lib"):
+        method = "system"
+    else:
+        method = "pip"
+
+    if os.path.exists(os.path.join(path, "lnxlink/edit.txt")):
+        method += "_edit"
+
+    return method
+
+
+def get_version():
+    """Get the current version and the path of the app"""
+    pkg_name = __package__.split(".", maxsplit=1)[0] if __package__ else __name__
+    try:
+        version = importlib.metadata.version(pkg_name)
+    except importlib.metadata.PackageNotFoundError:
+        version = importlib.metadata.version("lnxlink")
+    path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    if os.path.exists(os.path.join(path, "lnxlink/edit.txt")):
+        version += "+edit"
+        git_hash, _, return_code = syscommand(
+            f"git -c safe.directory=* -C {path} rev-parse --short HEAD",
+            ignore_errors=True,
+        )
+        if return_code == 0:
+            version += f"-{git_hash}"
+    return version, path
+
+
+def _get_caller_file():
+    """Find the filename of the caller outside helpers.py"""
+    frame = inspect.currentframe()
+    current_file = globals().get("__file__")
+    while frame:
+        if frame.f_code.co_filename != current_file:
+            return os.path.basename(frame.f_code.co_filename)
+        frame = frame.f_back
+    return ""
+
+
+# pylint: disable=consider-using-with
+def syscommand(command, ignore_errors=False, timeout=3, background=False, stdin=None):
+    """Global subprocess command"""
+    caller = _get_caller_file()
+    prefix = f"[{caller}] " if caller else ""
+    logger.debug("%sExecuting command: %s", prefix, command)
+
+    shell = not isinstance(command, list)
+
+    if isinstance(stdin, str):
+        stdin = stdin.encode("UTF-8")
 
     if background:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             command,
-            shell=True,
+            shell=shell,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if stdin is not None:
+            try:
+                proc.stdin.write(stdin)
+                proc.stdin.close()
+            except Exception:
+                pass
         return "", "", 0
 
     stdout = b""
@@ -34,7 +116,8 @@ def syscommand(command, ignore_errors=False, timeout=3, background=False):
     try:
         result = subprocess.run(
             command,
-            shell=True,
+            input=stdin,
+            shell=shell,
             check=False,
             capture_output=True,
             timeout=timeout,
@@ -49,18 +132,22 @@ def syscommand(command, ignore_errors=False, timeout=3, background=False):
         returncode = -1
         timed_out = True
 
+    except FileNotFoundError as err:
+        stdout = b""
+        stderr = str(err).encode("UTF-8")
+        returncode = 127
+
     stdout = stdout.decode("UTF-8", errors="replace").strip()
     stderr = stderr.decode("UTF-8", errors="replace").strip()
 
     if timed_out:
-        timeout_msg = f"Command timed out after {timeout} seconds"
-        stderr = f"{stderr}\n{timeout_msg}".strip()
+        stderr = f"{stderr}\nCommand timed out after {timeout} seconds".strip()
 
     if returncode != 0 and ignore_errors is False:
         if timed_out:
-            logger.error("Timeout with command: %s (%s)", command, stderr)
+            logger.error("%sTimeout with command: %s (%s)", prefix, command, stderr)
         else:
-            logger.error("Error with command: %s (%s)", command, stderr)
+            logger.error("%sError with command: %s (%s)", prefix, command, stderr)
 
     return stdout, stderr, returncode
 
@@ -125,37 +212,9 @@ def import_install_package(package, req_version="", syspackage=None):
         current_version = None
 
     if current_version is None or needs_update(current_version, req_version):
-        package_version = f"'{package}{req_version}'"
+        package_version = f"{package}{req_version}"
         logger.info("Installing %s...", package_version)
-        uv_bin = find_uv_bin()
-        returncode = -1
-        if uv_bin:
-            args = [
-                uv_bin,
-                "pip",
-                "install",
-                "--python",
-                sys.executable,
-                "--break-system-packages",
-                "-U",
-                "--quiet",
-                package_version,
-            ]
-            _, _, returncode = syscommand(args, ignore_errors=True, timeout=None)
-
-        if returncode != 0:
-            args = [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--break-system-packages",
-                "-U",
-                "--quiet",
-                package_version,
-            ]
-            _, _, returncode = syscommand(args, ignore_errors=True, timeout=None)
-        if returncode != 0:
+        if not install_package(package_version, upgrade=True, quiet=True):
             try:
                 if isinstance(syspackage, tuple):
                     return __import__(syspackage[0], fromlist=syspackage[1])
@@ -171,6 +230,55 @@ def import_install_package(package, req_version="", syspackage=None):
     except Exception as err:
         logger.error("Can't import package %s: %s", package, err)
         return None
+
+
+def install_package(package, upgrade=True, editable=False, quiet=True, timeout=None):
+    """Installs or upgrades a Python package using uv or pip with fallback"""
+    uv_bin = find_uv_bin()
+    returncode = -1
+
+    flags = []
+    if editable:
+        flags.append("-e")
+    if upgrade:
+        flags.append("-U")
+    if quiet:
+        flags.append("--quiet")
+
+    if uv_bin:
+        args = (
+            [
+                uv_bin,
+                "pip",
+                "install",
+                "--python",
+                sys.executable,
+                "--break-system-packages",
+            ]
+            + flags
+            + [package]
+        )
+        _, _, returncode = syscommand(args, ignore_errors=True, timeout=timeout)
+
+    if returncode != 0:
+        args = (
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--break-system-packages",
+            ]
+            + flags
+            + [package]
+        )
+        _, _, returncode = syscommand(args, ignore_errors=True, timeout=timeout)
+
+    if returncode != 0:
+        args = [sys.executable, "-m", "pip", "install"] + flags + [package]
+        _, _, returncode = syscommand(args, ignore_errors=True, timeout=timeout)
+
+    return returncode == 0
 
 
 def needs_update(current_version, request_version):

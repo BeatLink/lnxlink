@@ -1,7 +1,7 @@
 """MQTT methods"""
 
-# pylint: disable=attribute-defined-outside-init,too-many-instance-attributes
 
+# pylint: disable=import-outside-toplevel
 import asyncio
 import json
 import logging
@@ -12,10 +12,7 @@ import time
 import traceback
 from dataclasses import dataclass
 
-import aiohttp
-import distro
 import paho.mqtt.client as mqtt
-import requests
 
 from lnxlink.modules.scripts import helpers
 
@@ -38,39 +35,12 @@ class CommandMessage:
     payload: bytes
 
 
-class HomeAssistantApiClient:
-    """MQTT client shim for Home Assistant API transport."""
-
-    def subscribe(self, topic):
-        """Subscriptions are owned by the websocket bridge."""
-        logger.debug("Home Assistant websocket subscribes to %s", topic)
-
-
-class MQTT:
-    """Start LNXlink service that loads all modules and connects to MQTT"""
+class DirectMQTTClient:
+    """Direct MQTT broker client using paho-mqtt."""
 
     def __init__(self, config):
         self.config = config
-        self.publish_rc_code = 0
-        self.transport = self.config["mqtt"].get("transport", "mqtt")
-        self.use_homeassistant_api = self.transport == "homeassistant_api"
         self._disconnecting = False
-        self._ha_api_publish_mid = 0
-        self._ha_api_publish_lock = threading.Lock()
-        self._ha_api_stop = threading.Event()
-        self._ha_api_ws_thread = None
-        self._ha_api_on_message = None
-        self._on_connect_callback = None
-        self._on_message_callback = None
-
-        # Setup mqtt client object
-        if self.use_homeassistant_api:
-            self.client = HomeAssistantApiClient()
-        else:
-            self.client = self._mqtt_client()
-
-    def _mqtt_client(self):
-        """Create a direct MQTT client."""
         if hasattr(mqtt, "CallbackAPIVersion"):
             self.client = mqtt.Client(
                 client_id=f"LNXlink-{self.config['mqtt']['clientId']}",
@@ -80,94 +50,9 @@ class MQTT:
             self.client = mqtt.Client(
                 client_id=f"LNXlink-{self.config['mqtt']['clientId']}"
             )
-        return self.client
 
-    def publish(self, topic, payload, retain=True):
-        """Publishes messages to the MQTT broker"""
-        if self.use_homeassistant_api:
-            return self.publish_homeassistant_api(topic, payload, retain)
-
-        msg_info = self.client.publish(
-            topic,
-            payload=payload,
-            qos=self.config["mqtt"]["lwt"]["qos"],
-            retain=retain,
-        )
-        logger.debug("Message RC Code: %s, MQTT Number: %s", msg_info.rc, msg_info.mid)
-        self.publish_rc_code = msg_info.rc
-        # if self.publish_rc_code != 0:
-        #     logger.error("Publish RC Code Error, trying to reconnect...")
-        #     self.publish_rc_code = 0
-        #     self.client.disconnect()
-        #     time.sleep(2)
-        #     self.client.reconnect()
-        #     time.sleep(3)
-        return msg_info
-
-    def reconnect(self):
-        """Try to reconnect to broker"""
-        if self.use_homeassistant_api:
-            logger.info("Reconnecting to Home Assistant MQTT websocket")
-            self._restart_homeassistant_api_websocket()
-            return
-
-        logger.info("Reconnecting to MQTT")
-        self._disconnecting = False
-        self.publish_rc_code = 0
-        self.client.disconnect()
-        time.sleep(2)
-        self.client.reconnect()
-        time.sleep(3)
-
-    def disconnect(self):
-        """Used when exiting"""
-        self._disconnecting = True
-        if self.use_homeassistant_api:
-            self.send_lwt("OFF")
-            self._ha_api_stop.set()
-            logger.info("Disconnected from Home Assistant MQTT API.")
-            return
-
-        self.send_lwt("OFF")
-        self.client.disconnect()
-        logger.info("Disconnected from MQTT.")
-
-    def send_lwt(self, status):
-        """Sends the status of lwt, ON or OFF"""
-        if status == "OFF" and not self.config["mqtt"]["lwt"]["enabled"]:
-            return
-        self.publish(
-            f"{self.config['pref_topic']}/lwt",
-            payload=status,
-            retain=True,
-        )
-
-    def setup_mqtt(self, on_connect, on_message):
-        """Creates the mqtt object"""
-        self._on_connect_callback = on_connect
-        self._on_message_callback = on_message
-        if self.use_homeassistant_api:
-            return self.setup_homeassistant_api(on_connect, on_message)
-
-        if self.setup_direct_mqtt(on_connect, on_message):
-            return True
-
-        if self.transport == "auto":
-            logger.warning(
-                "Direct MQTT connection failed in auto transport mode; "
-                "using Home Assistant MQTT API instead"
-            )
-            return self.switch_to_homeassistant_api()
-
-        return False
-
-    def setup_direct_mqtt(self, on_connect, on_message):
-        """Connect to the configured MQTT broker directly."""
-        self.client.on_connect = on_connect
-        self.client.on_message = on_message
-        self.client.on_disconnect = self.on_disconnect
-        self.client.on_publish = self.on_publish
-
+    def _setup_auth(self):
+        """Configure authentication and TLS certificates for direct MQTT."""
         keyfile = self.config["mqtt"]["auth"].get("keyfile")
         keyfile = None if keyfile == "" else keyfile
         certfile = self.config["mqtt"]["auth"].get("certfile")
@@ -197,6 +82,15 @@ class MQTT:
             )
             if ca_certs is None:
                 self.client.tls_insecure_set(True)
+
+    def connect(self, on_connect, on_message, on_disconnect, on_publish):
+        """Connect to the configured MQTT broker directly."""
+        self.client.on_connect = on_connect
+        self.client.on_message = on_message
+        self.client.on_disconnect = on_disconnect
+        self.client.on_publish = on_publish
+
+        self._setup_auth()
         if self.config["mqtt"]["lwt"]["enabled"]:
             self.client.will_set(
                 f"{self.config['pref_topic']}/lwt",
@@ -204,25 +98,43 @@ class MQTT:
                 qos=self.config["mqtt"]["lwt"]["qos"],
                 retain=True,
             )
+        keepalive = self.config.get("mqtt", {}).get("keepalive")
+        if keepalive is None:
+            keepalive = int(round(int(self.config.get("update_interval", 5)) * 1.5, 0))
+        else:
+            keepalive = int(keepalive)
         try:
             self.client.connect(
                 host=self.config["mqtt"]["server"],
                 port=self.config["mqtt"]["port"],
-                keepalive=60,
+                keepalive=keepalive,
             )
-        except ssl.SSLCertVerificationError:
-            logger.info("TLS not verified, using insecure connection instead")
+        except ssl.SSLCertVerificationError as err:
+            if not self.config["mqtt"]["auth"].get("tls_allow_insecure", False):
+                logger.error(
+                    "TLS certificate verification failed for MQTT broker %s:%s: %s",
+                    self.config["mqtt"]["server"],
+                    self.config["mqtt"]["port"],
+                    err,
+                )
+                return False
+            logger.warning(
+                "TLS certificate verification failed for MQTT broker %s:%s: %s",
+                self.config["mqtt"]["server"],
+                self.config["mqtt"]["port"],
+                err,
+            )
             self.client.tls_insecure_set(True)
             try:
                 self.client.connect(
                     host=self.config["mqtt"]["server"],
                     port=self.config["mqtt"]["port"],
-                    keepalive=60,
+                    keepalive=keepalive,
                 )
-            except Exception as err:
+            except Exception as err2:
                 logger.error(
                     "Error establishing connection to MQTT broker: %s, %s",
-                    err,
+                    err2,
                     traceback.format_exc(),
                 )
                 return False
@@ -236,34 +148,59 @@ class MQTT:
         self.client.loop_start()
         return True
 
-    def switch_to_homeassistant_api(self):
-        """Switch the active transport to Home Assistant's MQTT API."""
-        if self.use_homeassistant_api:
-            return True
-        if self._on_connect_callback is None or self._on_message_callback is None:
-            logger.error("Cannot switch to Home Assistant MQTT API before setup")
-            return False
-
-        logger.info("Switching MQTT transport to Home Assistant API")
-        self.use_homeassistant_api = True
-        self._ha_api_stop.set()
-        try:
-            self.client.loop_stop()
-        except Exception:
-            logger.debug("Could not stop direct MQTT client loop")
-        self.client = HomeAssistantApiClient()
-        self._ha_api_stop.clear()
-        return self.setup_homeassistant_api(
-            self._on_connect_callback,
-            self._on_message_callback,
+    def publish(self, topic, payload, qos=1, retain=True):
+        """Publishes message using direct MQTT broker."""
+        msg_info = self.client.publish(
+            topic,
+            payload=payload,
+            qos=qos,
+            retain=retain,
         )
+        logger.debug("Message RC Code: %s, MQTT Number: %s", msg_info.rc, msg_info.mid)
+        return msg_info
 
-    def _homeassistant_api_config(self):
+    def reconnect(self):
+        """Reconnect to direct MQTT broker."""
+        logger.info("Reconnecting to MQTT")
+        self._disconnecting = False
+        self.client.disconnect()
+        time.sleep(2)
+        self.client.reconnect()
+        time.sleep(3)
+
+    def disconnect(self):
+        """Disconnect from direct MQTT broker."""
+        self._disconnecting = True
+        self.client.disconnect()
+        logger.info("Disconnected from MQTT.")
+
+    def subscribe(self, topic):
+        """Subscribe to topic on direct MQTT broker."""
+        return self.client.subscribe(topic)
+
+
+# pylint: disable=too-many-instance-attributes
+class HomeAssistantApiClient:
+    """MQTT client transport via Home Assistant HTTP and WebSocket APIs."""
+
+    def __init__(self, config):
+        import requests
+
+        self.config = config
+        self._publish_mid = 0
+        self._publish_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.is_disconnecting = False
+        self._ws_thread = None
+        self._on_message_callback = None
+        self.session = requests.Session()
+
+    def _get_ha_config(self):
         """Return Home Assistant API transport configuration."""
         ha_config = self.config["mqtt"].get("homeassistant", {})
         return {
             "url": str(ha_config.get("url", "")).rstrip("/"),
-            "token": self._homeassistant_api_token(ha_config),
+            "token": self._get_token(ha_config),
             "timeout": float(ha_config.get("timeout", 20)),
             "verify_ssl": self._config_bool(ha_config.get("verify_ssl", True)),
             "subscribe_commands": self._config_bool(
@@ -272,62 +209,61 @@ class MQTT:
         }
 
     def _config_bool(self, value):
-        """Parse boolean config values that may come from YAML or env strings."""
+        """Parse boolean config values."""
         if isinstance(value, bool):
             return value
         if isinstance(value, str):
             return value.lower() in ["1", "true", "yes", "on"]
         return bool(value)
 
-    def _homeassistant_api_token(self, ha_config):
+    def _get_token(self, ha_config):
         """Read the Home Assistant long-lived access token."""
-        token = str(ha_config.get("token", ""))
-        if token:
-            return token
+        token = str(ha_config.get("token", "")).strip()
+        if not token:
+            return ""
 
-        token_env = str(ha_config.get("token_env", ""))
-        if token_env:
-            token = os.environ.get(token_env, "")
-            if token:
-                return token
-
-        token_file = str(ha_config.get("token_file", ""))
-        if token_file:
+        token_path = os.path.expanduser(token)
+        if os.path.isfile(token_path):
             try:
-                with open(os.path.expanduser(token_file), encoding="UTF-8") as file:
+                with open(token_path, encoding="UTF-8") as file:
                     return file.read().strip()
             except OSError as err:
                 logger.error("Could not read Home Assistant token file: %s", err)
+                return ""
 
-        return ""
+        return token
 
-    def setup_homeassistant_api(self, on_connect, on_message):
+    def connect(self, on_connect, on_message, on_disconnect, on_publish):
         """Connect to Home Assistant API for MQTT publish and commands."""
-        ha_config = self._homeassistant_api_config()
+        ha_config = self._get_ha_config()
         if not ha_config["url"] or not ha_config["token"]:
             logger.error(
                 "Home Assistant MQTT API transport needs mqtt.homeassistant.url "
-                "and token/token_env/token_file"
+                "and token"
             )
             return False
 
-        self._ha_api_on_message = on_message
+        self._on_message_callback = on_message
         logger.info("Home Assistant MQTT API transport: %s", ha_config["url"])
-        on_connect(self.client, None, None, 0)
+        on_connect(self, None, None, 0)
         if ha_config["subscribe_commands"]:
-            self._start_homeassistant_api_websocket()
+            self._start_websocket()
         return True
 
-    def publish_homeassistant_api(self, topic, payload, retain=True):
-        """Publish MQTT through Home Assistant's mqtt.publish service."""
-        ha_config = self._homeassistant_api_config()
-        if isinstance(payload, bytes):
+    def publish(self, topic, payload, qos=1, retain=True):
+        """Publish MQTT message through Home Assistant's mqtt.publish service."""
+        ha_config = self._get_ha_config()
+        if payload is None:
+            payload = ""
+        elif isinstance(payload, bytes):
             payload = payload.decode("UTF-8")
         elif not isinstance(payload, str):
             payload = str(payload)
 
+        timeout = 2.0 if self.is_disconnecting else ha_config["timeout"]
+
         try:
-            response = requests.post(
+            response = self.session.post(
                 f"{ha_config['url']}/api/services/mqtt/publish",
                 headers={
                     "Authorization": f"Bearer {ha_config['token']}",
@@ -336,10 +272,10 @@ class MQTT:
                 json={
                     "topic": topic,
                     "payload": payload,
-                    "qos": self.config["mqtt"]["lwt"]["qos"],
+                    "qos": qos,
                     "retain": retain,
                 },
-                timeout=ha_config["timeout"],
+                timeout=timeout,
                 verify=ha_config["verify_ssl"],
             )
             response.raise_for_status()
@@ -349,45 +285,63 @@ class MQTT:
             logger.debug(traceback.format_exc())
             rc = 1
 
-        with self._ha_api_publish_lock:
-            self._ha_api_publish_mid += 1
-            mid = self._ha_api_publish_mid
+        with self._publish_lock:
+            self._publish_mid += 1
+            mid = self._publish_mid
 
         logger.debug("Message RC Code: %s, MQTT Number: %s", rc, mid)
-        self.publish_rc_code = rc
         return PublishInfo(rc=rc, mid=mid)
 
-    def _start_homeassistant_api_websocket(self):
+    def reconnect(self):
+        """Reconnect to Home Assistant MQTT WebSocket."""
+        logger.info("Reconnecting to Home Assistant MQTT websocket")
+        self._stop_event.set()
+        if self._ws_thread and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=2)
+        self._start_websocket()
+
+    def disconnect(self):
+        """Disconnect from Home Assistant API."""
+        self.is_disconnecting = True
+        self._stop_event.set()
+        if self._ws_thread and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=2)
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        logger.info("Disconnected from Home Assistant MQTT API.")
+
+    def subscribe(self, topic):
+        """Subscriptions are owned by the websocket bridge."""
+        logger.debug("Home Assistant websocket subscribes to %s", topic)
+
+    def _start_websocket(self):
         """Start the Home Assistant websocket MQTT subscription thread."""
-        if self._ha_api_ws_thread and self._ha_api_ws_thread.is_alive():
+        if self._ws_thread and self._ws_thread.is_alive():
             return
-        self._ha_api_stop.clear()
-        self._ha_api_ws_thread = threading.Thread(
-            target=self._run_homeassistant_api_websocket,
+        self._stop_event.clear()
+        self._ws_thread = threading.Thread(
+            target=self._run_websocket,
             daemon=True,
         )
-        self._ha_api_ws_thread.start()
+        self._ws_thread.start()
 
-    def _restart_homeassistant_api_websocket(self):
-        """Restart the Home Assistant websocket MQTT subscription thread."""
-        self._ha_api_stop.set()
-        if self._ha_api_ws_thread and self._ha_api_ws_thread.is_alive():
-            self._ha_api_ws_thread.join(timeout=5)
-        self._start_homeassistant_api_websocket()
-
-    def _run_homeassistant_api_websocket(self):
+    def _run_websocket(self):
         """Run the Home Assistant websocket bridge in its own event loop."""
         try:
-            asyncio.run(self._homeassistant_api_websocket_loop())
+            asyncio.run(self._websocket_loop())
         except Exception as err:
             logger.error("Home Assistant MQTT websocket failed: %s", err)
             logger.debug(traceback.format_exc())
 
-    async def _homeassistant_api_websocket_loop(self):
+    async def _websocket_loop(self):
         """Subscribe to command topics through Home Assistant websocket."""
-        ha_config = self._homeassistant_api_config()
+        import aiohttp
+
+        ha_config = self._get_ha_config()
         command_topic = f"{self.config['pref_topic']}/commands/#"
-        while not self._ha_api_stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(
@@ -428,16 +382,18 @@ class MQTT:
                             "Subscribed to MQTT commands through Home Assistant API: %s",
                             command_topic,
                         )
-                        await self._homeassistant_api_receive_commands(websocket)
+                        await self._receive_commands(websocket)
             except Exception as err:
-                if not self._ha_api_stop.is_set():
+                if not self._stop_event.is_set():
                     logger.error("Home Assistant MQTT websocket disconnected: %s", err)
                     logger.debug(traceback.format_exc())
                     await asyncio.sleep(5)
 
-    async def _homeassistant_api_receive_commands(self, websocket):
+    async def _receive_commands(self, websocket):
         """Forward Home Assistant websocket MQTT events to the command handler."""
-        while not self._ha_api_stop.is_set():
+        import aiohttp
+
+        while not self._stop_event.is_set():
             try:
                 message = await websocket.receive(timeout=1)
             except asyncio.TimeoutError:
@@ -447,11 +403,11 @@ class MQTT:
                 event = data.get("event", {})
                 topic = event.get("topic")
                 payload = event.get("payload", "")
-                if topic and self._ha_api_on_message is not None:
+                if topic and self._on_message_callback is not None:
                     if not isinstance(payload, str):
                         payload = json.dumps(payload)
-                    self._ha_api_on_message(
-                        self.client,
+                    self._on_message_callback(
+                        self,
                         None,
                         CommandMessage(topic=topic, payload=payload.encode("UTF-8")),
                     )
@@ -462,7 +418,110 @@ class MQTT:
             ):
                 raise RuntimeError(f"websocket closed: {message.type}")
 
-    # pylint: disable=too-many-arguments
+
+class MQTT:
+    """Start LNXlink service that loads all modules and connects to MQTT"""
+
+    def __init__(self, config):
+        self.config = config
+        self.publish_rc_code = 0
+        self._device_model = None
+        self.transport = self.config["mqtt"].get("transport", "mqtt")
+        self._on_connect_callback = None
+        self._on_message_callback = None
+        self._on_transport_switch_callback = None
+
+        if self.transport == "homeassistant_api":
+            self.client = HomeAssistantApiClient(config)
+        else:
+            self.client = DirectMQTTClient(config)
+
+    def publish(self, topic, payload, retain=True):
+        """Publishes messages to the MQTT broker"""
+        qos = self.config["mqtt"]["lwt"]["qos"]
+        msg_info = self.client.publish(topic, payload, qos=qos, retain=retain)
+        self.publish_rc_code = msg_info.rc
+        return msg_info
+
+    @property
+    def delivery_token(self):
+        """Identify the client responsible for the current delivery attempt."""
+        return self.client
+
+    def publish_accepted(self, msg_info):
+        """Return whether the transport accepted responsibility for delivery."""
+        if msg_info.rc == mqtt.MQTT_ERR_SUCCESS:
+            return True
+        return (
+            self.transport != "auto"
+            and isinstance(self.client, DirectMQTTClient)
+            and self.config["mqtt"]["lwt"]["qos"] > 0
+            and msg_info.rc == mqtt.MQTT_ERR_NO_CONN
+        )
+
+    def reconnect(self):
+        """Try to reconnect to broker"""
+        self.publish_rc_code = 0
+        self.client.reconnect()
+
+    def disconnect(self):
+        """Used when exiting"""
+        self.send_lwt("OFF")
+        self.client.disconnect()
+
+    def send_lwt(self, status):
+        """Sends the status of lwt, ON or OFF"""
+        if status == "OFF" and not self.config["mqtt"]["lwt"]["enabled"]:
+            return
+        self.publish(
+            f"{self.config['pref_topic']}/lwt",
+            payload=status,
+            retain=True,
+        )
+
+    def setup_mqtt(self, on_connect, on_message, on_transport_switch=None):
+        """Creates the mqtt object"""
+        self._on_connect_callback = on_connect
+        self._on_message_callback = on_message
+        self._on_transport_switch_callback = on_transport_switch
+
+        if self.client.connect(
+            on_connect=on_connect,
+            on_message=on_message,
+            on_disconnect=self.on_disconnect,
+            on_publish=self.on_publish,
+        ):
+            return True
+
+        if self.transport == "auto":
+            logger.warning(
+                "Direct MQTT connection failed in auto transport mode; "
+                "using Home Assistant MQTT API instead"
+            )
+            return self.switch_to_homeassistant_api()
+
+        return False
+
+    def switch_to_homeassistant_api(self):
+        """Switch the active transport to Home Assistant's MQTT API."""
+        if isinstance(self.client, HomeAssistantApiClient):
+            return True
+        if self._on_connect_callback is None or self._on_message_callback is None:
+            logger.error("Cannot switch to Home Assistant MQTT API before setup")
+            return False
+
+        logger.info("Switching MQTT transport to Home Assistant API")
+        self.client.disconnect()
+        if self._on_transport_switch_callback is not None:
+            self._on_transport_switch_callback()
+        self.client = HomeAssistantApiClient(self.config)
+        return self.client.connect(
+            on_connect=self._on_connect_callback,
+            on_message=self._on_message_callback,
+            on_disconnect=self.on_disconnect,
+            on_publish=self.on_publish,
+        )
+
     def on_publish(self, client, userdata, mid, *args):
         """Trying to reconnect if the reason code is not Success"""
         reason_code = args[0] if args else None
@@ -472,26 +531,33 @@ class MQTT:
 
     def on_disconnect(self, *args):
         """Disconnected from MQTT broker"""
+        if getattr(self.client, "_disconnecting", False):
+            return
         logger.warning("Lost connection to MQTT Broker...")
-        if self.transport == "auto" and not self._disconnecting:
+        if self.transport == "auto":
             threading.Thread(
                 target=self.switch_to_homeassistant_api, daemon=True
             ).start()
 
     def get_rcode_name(self, rcode):
         """Returns the rcode message"""
-        if self.use_homeassistant_api and rcode == 0:
+        if isinstance(self.client, HomeAssistantApiClient) and rcode == 0:
             return "Success"
         return mqtt.connack_string(rcode)
 
     # pylint: disable=too-many-locals
     def setup_discovery_entities(self, addon, service, exp_name, options):
         """Send discovery information on Home Assistant for controls"""
+        if self._device_model is None:
+            import distro
+
+            self._device_model = f"{distro.name()} {distro.version()}"
+
         discovery_template = {
             "device": {
                 "identifiers": [self.config["mqtt"]["clientId"]],
                 "name": self.config["mqtt"]["clientId"],
-                "model": f"{distro.name()} {distro.version()}",
+                "model": self._device_model,
                 "manufacturer": "LNXlink",
                 "sw_version": self.config["version"],
             },
@@ -612,6 +678,7 @@ class MQTT:
                 "command_previous_topic": f"{command_topic}/previous",
                 "command_previous_payload": "Previous",
                 "command_playmedia_topic": f"{command_topic}/play_media",
+                "command_seek_topic": f"{command_topic}/seek",
             },
             "notify": {
                 "command_topic": command_topic,
@@ -625,7 +692,7 @@ class MQTT:
             },
             "event": {
                 "automation_type": "trigger",
-                "platform": "device_automation",
+                "topic": state_topic,
                 "type": options.get("event_type", "button_short_press"),
                 "subtype": options.get("event_subtype", "turn_on"),
             },
@@ -646,14 +713,34 @@ class MQTT:
             discovery.pop("json_attributes_topic", None)
             discovery.pop("json_attributes_template", None)
         discovery_prefix = self.config["mqtt"]["discovery"]["prefix"]
-        discovery_topic = (
-            f"{discovery_prefix}/{options['type']}/lnxlink/"
-            f"{discovery['unique_id']}/config"
+        discovery_component = (
+            "device_automation" if options["type"] == "event" else options["type"]
         )
-        self.publish(
+        discovery_unique_id = discovery["unique_id"]
+        if options["type"] == "event":
+            discovery = {
+                key: discovery[key]
+                for key in (
+                    "automation_type",
+                    "device",
+                    "topic",
+                    "type",
+                    "subtype",
+                )
+            }
+        discovery_topic = (
+            f"{discovery_prefix}/{discovery_component}/lnxlink/"
+            f"{discovery_unique_id}/config"
+        )
+        msg_info = self.publish(
             discovery_topic,
             payload=json.dumps(discovery),
         )
+        if getattr(msg_info, "rc", None) != 0:
+            raise RuntimeError(
+                f"Could not publish Home Assistant discovery topic "
+                f"{discovery_topic}: MQTT RC {getattr(msg_info, 'rc', None)}"
+            )
         if options["type"] == "media_player":
             logger.info(
                 "MQTT Media Player configuration name: lnxlink/%s",

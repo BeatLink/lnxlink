@@ -133,11 +133,18 @@ class QuayClient(RegistryClient):
         if QUAY_TOKEN:
             headers["Authorization"] = f"Bearer {QUAY_TOKEN}"
         try:
-            url = f"{self.base_url}/repository/{self.repo}/tag/{tag}"
-            async with self.session.get(url, headers=headers) as response:
+            # Quay has no GET on /tag/{tag}; look the tag up in the tag list
+            url = f"{self.base_url}/repository/{self.repo}/tag/"
+            params = {"specificTag": tag, "onlyActiveTags": "true"}
+            async with self.session.get(
+                url, headers=headers, params=params
+            ) as response:
                 response.raise_for_status()
                 data = await response.json()
-                return data.get("manifest_digest")
+                for tag_info in data.get("tags", []):
+                    if tag_info.get("name") == tag:
+                        return tag_info.get("manifest_digest")
+                return None
         except aiohttp.ClientError:
             return None
 
@@ -229,8 +236,18 @@ class DockerUpdateStatus:
             registry, repo, tag = RegistryClient.parse_repo_name(full_tag)
             local_digest = ""
             if repo_digests:
+                # Docker Engine often reports RepoDigests without the
+                # registry/"library/" prefix that parse_repo_name() adds for
+                # official images (e.g. "nginx@sha256:..." instead of
+                # "library/nginx@sha256:..."), so also match on the bare
+                # repo name to avoid a permanent false positive for those.
+                short_repo = repo.split("/")[-1]
                 for d in repo_digests:
-                    if d.startswith(repo) or d.startswith(f"{registry}/{repo}"):
+                    if (
+                        d.startswith(repo)
+                        or d.startswith(f"{registry}/{repo}")
+                        or d.startswith(f"{short_repo}@")
+                    ):
                         local_digest = d.split("@")[1]
                         break
             if not local_digest:
