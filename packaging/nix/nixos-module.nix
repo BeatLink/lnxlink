@@ -56,6 +56,9 @@ let
           install -m 0600 ${sourceConfig} "$config"
         ''
     }
+    if [ -x ${cfg.package}/bin/lnxlink-fill-config-defaults ]; then
+      ${cfg.package}/bin/lnxlink-fill-config-defaults "$config"
+    fi
   '';
 
   serviceConfig = {

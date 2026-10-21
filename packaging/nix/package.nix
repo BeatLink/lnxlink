@@ -181,6 +181,19 @@ python3Packages.buildPythonApplication {
     ]
     ++ extraPythonPackages python3Packages;
 
+  # lnxlink only fills missing config keys from its template when it creates the
+  # file, so the NixOS and Home Manager modules run this after seeding theirs.
+  # The Python fixup wraps it with the same import path as `lnxlink` itself.
+  postInstall = ''
+    cat > $out/bin/lnxlink-fill-config-defaults <<'EOF'
+    #!${python3Packages.python.interpreter}
+    import sys
+    from lnxlink.config_setup import validate_config
+    validate_config(sys.argv[1])
+    EOF
+    chmod +x $out/bin/lnxlink-fill-config-defaults
+  '';
+
   nativeBuildInputs = [ makeWrapper ];
 
   # Suffix rather than prefix: on NixOS the running system's systemd and the
